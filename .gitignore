@@ -1,0 +1,36 @@
+# Secrets / variáveis de ambiente — NUNCA commitar ficheiros reais
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtualenvs
+venv/
+.venv/
+env/
+ENV/
+
+# Ferramentas / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs e caches locais
+*.log
+.cache/
+
+# Output do modo preview (dry-run) — nunca commitar
+preview.md

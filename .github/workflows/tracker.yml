@@ -1,0 +1,158 @@
+name: Bot Mercado FCPorto
+
+on:
+  schedule:
+    # Corre todos os dias às 12:00 e às 20:00 (UTC)
+    # O step "Verificar janela de transferências" abaixo decide se o bot corre ou não.
+    - cron: '0 12,20 * * *'
+  workflow_dispatch: # Botão manual no GitHub para correr quando quiseres
+    inputs:
+      dry_run:
+        description: "Modo preview (não publica no Reddit, gera preview.md)"
+        type: boolean
+        required: false
+        default: false
+      force:
+        description: "Forçar execução mesmo fora da janela de transferências"
+        type: boolean
+        required: false
+        default: false
+
+# Permite ao `gh` ler o histórico de runs (para o failsafe)
+permissions:
+  actions: read
+  contents: read
+
+# Garante que duas runs nunca se sobrepõem (evita editar o post em paralelo)
+concurrency:
+  group: portobotnews-tracker
+  cancel-in-progress: false # deixa a run atual terminar; não interrompe um edit a meio
+
+jobs:
+  update-reddit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # mata a run se ficar presa (ex.: LLM pendurado)
+
+    steps:
+      # ─── Verificar se estamos na janela de transferências ativa ────────────
+      # O bot só corre durante os períodos de mercado aberto:
+      #   - Verão: 1 mês antes (1 junho) até 1 semana depois do fecho (~11 setembro)
+      #   - Inverno: 1 mês antes (4 dezembro) até 1 semana depois do fecho (~8 fevereiro)
+      # Runs manuais podem forçar a execução com o input "force".
+      - name: Verificar janela de transferências
+        id: market_check
+        if: github.event_name == 'schedule'
+        run: |
+          # Datas oficiais das janelas de transferências (Liga Portugal / FPF)
+          # Padrão consistente ano a ano:
+          #   Verão: abre 1 julho, fecha ~4 setembro → ativo de 1 junho a 11 setembro
+          #   Inverno: abre ~4 janeiro, fecha ~1 fevereiro → ativo de 4 dezembro a 8 fevereiro
+          #
+          # Para atualizar as datas, edita as variáveis abaixo.
+          TODAY=$(date +%m%d)
+          YEAR=$(date +%Y)
+
+          # Verão: 1 junho (0601) a 11 setembro (0911)
+          SUMMER_START=0601
+          SUMMER_END=0911
+
+          # Inverno: 4 dezembro (1204) a 31 dezembro (1231) + 1 janeiro (0101) a 8 fevereiro (0208)
+          WINTER_START_DEC=1204
+          WINTER_END_DEC=1231
+          WINTER_START_JAN=0101
+          WINTER_END_FEB=0208
+
+          ACTIVE=false
+          if [ "$TODAY" -ge "$SUMMER_START" ] && [ "$TODAY" -le "$SUMMER_END" ]; then
+            ACTIVE=true
+            echo "📅 Janela ativa: Mercado de Verão"
+          elif [ "$TODAY" -ge "$WINTER_START_DEC" ] && [ "$TODAY" -le "$WINTER_END_DEC" ]; then
+            ACTIVE=true
+            echo "📅 Janela ativa: Mercado de Inverno (pré-abertura)"
+          elif [ "$TODAY" -ge "$WINTER_START_JAN" ] && [ "$TODAY" -le "$WINTER_END_FEB" ]; then
+            ACTIVE=true
+            echo "📅 Janela ativa: Mercado de Inverno"
+          fi
+
+          if [ "$ACTIVE" = "true" ]; then
+            echo "✅ Janela de transferências ativa — o bot vai correr."
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          else
+            echo "⏸️  Fora da janela de transferências — o bot não vai correr."
+            echo "   (Para forçar, usa workflow_dispatch com o input 'force' = true)"
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sair se fora da janela de transferências
+        if: github.event_name == 'schedule' && steps.market_check.outputs.should_run != 'true'
+        run: |
+          echo "⏸️  Run abortada: fora da janela de transferências."
+          exit 0
+
+      # ─── Failsafe: abortar se as últimas 2 runs falharam ───────────────────
+      - name: Failsafe — abortar se as últimas 2 runs falharam
+        if: github.event_name == 'schedule' && steps.market_check.outputs.should_run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          THRESHOLD=2
+          FAILS=$(gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow tracker.yml \
+            --branch "${{ github.ref_name }}" \
+            --status completed \
+            --limit 2 \
+            --json conclusion \
+            --jq '[.[] | select(.conclusion=="failure" or .conclusion=="timed_out")] | length')
+          echo "Falhas nas últimas 2 runs completadas: $FAILS (limiar: $THRESHOLD)"
+          if [ "$FAILS" -ge "$THRESHOLD" ]; then
+            echo "::error::FAILSAFE ativado: as últimas 2 runs agendadas falharam consecutivamente. A abortar para evitar loop e custos. Corre manualmente (workflow_dispatch) após corrigir o problema para desbloquear as runs agendadas."
+            exit 1
+          fi
+          echo "✅ Failsafe OK — a prosseguir."
+
+      - name: Clonar o Repositório
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'schedule' && steps.market_check.outputs.should_run == 'true')
+        uses: actions/checkout@v4
+
+      - name: Configurar o Python
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'schedule' && steps.market_check.outputs.should_run == 'true')
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Dependências
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'schedule' && steps.market_check.outputs.should_run == 'true')
+        run: pip install -r requirements.txt
+
+      - name: Atualizar / Criar Post no Reddit
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'schedule' && steps.market_check.outputs.should_run == 'true')
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_USERNAME: ${{ secrets.REDDIT_USERNAME }}
+          REDDIT_PASSWORD: ${{ secrets.REDDIT_PASSWORD }}
+          REDDIT_POST_ID: ${{ secrets.REDDIT_POST_ID }}
+          GITHUB_REPO_URL: "https://github.com/${{ github.repository }}"
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: python main.py
+
+      - name: Upload do preview (apenas em dry-run)
+        if: github.event.inputs.dry_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview
+          path: preview.md
+          retention-days: 7
