@@ -1,8 +1,10 @@
-# PortoBotNews
+# PortoBotNews — v2.0
 
 Bot open-source que mantém uma thread no Reddit (r/FCPorto) sempre atualizada com as últimas notícias e rumores de transferências do FC Porto, em todas as modalidades.
 
-O bot pesquisa a web com o **DuckDuckGo** e processa os resultados com um **LLM gratuito** (OpenCode Zen, DeepSeek ou Groq — com fallback automático), organiza a informação em tabelas de Markdown bonitas para o Reddit, classifica a confiança dos rumores consoante as fontes, e atualiza (ou cria) o post automaticamente — com um link para este repositório no rodapé, para total transparência.
+O bot pesquisa a web com o **DuckDuckGo** (com retry automático e filtragem por data) e processa os resultados com um **LLM gratuito** (OpenCode Zen, DeepSeek ou Groq — com fallback automático), organiza a informação em tabelas de Markdown bonitas para o Reddit, classifica a confiança dos rumores consoante as fontes, e atualiza (ou cria) o post automaticamente — com um link para este repositório no rodapé, para total transparência.
+
+**v2.0** inclui validação de conteúdo (deteta URLs alucinadas, tabelas mal formatadas, nomes inventados), deduplicação de URLs entre runs, deteção de alterações (salta o LLM se nada mudou), notificações via GitHub Issues em caso de falha, arquivamento de threads de janelas anteriores, e testes unitários (54 testes, todos a passar).
 
 Corre automaticamente no **GitHub Actions** durante os períodos de mercado aberto (verão e inverno), sem servidor e 100% gratuito.
 
@@ -10,12 +12,24 @@ Corre automaticamente no **GitHub Actions** durante os períodos de mercado aber
 
 ## Como funciona
 
-1. **Pesquisa web** com o DuckDuckGo — obtém artigos reais de transferências de todas as fontes listadas em `sources/trustworthy.md` e `sources/sketchy.md` (queries dinâmicas com `site:` por cada domínio).
-2. **Geração de conteúdo** com LLM — os artigos encontrados são passados a um LLM (OpenCode Zen → DeepSeek → Groq, com fallback automático) que os organiza em tabelas Markdown com ícones, ranking de confiança e fontes hiperlinkadas.
-3. **Atualização do Reddit** — o bot autentica-se no Reddit, vai buscar o conteúdo atual da thread e decide:
-   - **Se a thread já tiver sido atualizada pelo bot** → pede ao LLM que **atualize** o conteúdo existente (preserva rumores válidos, atualiza estados, adiciona novos, remove rumores caducados).
-   - **Se a thread ainda for nova / "lixo" / nunca atualizada pelo bot** → pede ao LLM que **crie o conteúdo do zero**.
-4. **Publicação** — anexa um rodapé com o link do GitHub (transparência) e publica/edita o post.
+1. **Pesquisa web** com o DuckDuckGo — obtém artigos reais de transferências de todas as fontes listadas em `sources/trustworthy.md` e `sources/sketchy.md` (queries dinâmicas com `site:` por cada domínio, com termos diversificados). Com **retry automático** (2 tentativas com backoff exponencial), **filtragem por data** (best-effort: remove artigos cuja data no URL ou snippet tenha mais de 30 dias), e **queries phase-aware** (confirmadas, rumor, negociação — capta notícias em todas as fases do ciclo de transferência).
+2. **RSS feeds** — suplementa o DuckDuckGo com artigos mais frescos de 5 fontes portuguesas (O Jogo, Record, Maisfutebol, Observador, Notícias ao Minuto). Os feeds RSS têm datas de publicação reais (não dependem de parsing de snippets).
+3. **Deduplicação** — URLs já processados em runs anteriores são ignorados (cache em `.cache/processed_urls.json` com expiração de 3 dias). A cache regista também a assinatura do conteúdo (title+snippet), pelo que um artigo *atualizado* (título ou resumo diferentes) volta a ser considerado mesmo dentro da janela de expiração.
+4. **Deteção de alterações** — se não há artigos novos desde a última run, o bot salta o LLM completamente (poupa tokens e APIs calls). Após gerar conteúdo, se o resultado for idêntico ao último publicado, o bot salta também o edit do Reddit.
+5. **Geração de conteúdo** com LLM (Passo 1) — os artigos são passados a um LLM (OpenCode Zen → DeepSeek → Groq, com fallback automático) que organiza o **rascunho** em tabelas Markdown com ícones, ranking de confiança e fontes hiperlinkadas, **e identifica itens que precisam de re-pesquisa** para melhorar a qualidade.
+6. **Re-pesquisa** (se necessário) — o bot faz pesquisas adicionais específicas sobre itens mal documentados (ex: "Diogo Costa Chelsea transfer fee 2026").
+7. **Refinamento** com LLM (Passo 2) — o LLM refina o rascunho com a nova informação, substituindo fontes fracas, preenchendo dados em falta e removendo rumores desmentidos.
+8. **Validação de conteúdo** — antes de publicar, o bot verifica:
+   - ✅ URLs existem nos resultados da pesquisa (deteta alucinações)
+   - ✅ Tabelas Markdown têm colunas consistentes
+   - ✅ Nomes de jogadores são reais (não descrições como "Pérola do Real Madrid")
+   - ✅ Fontes sketchy (Tier 2) são sinalizadas como aviso
+   - ✅ Conteúdo tem tamanho mínimo (>200 caracteres)
+9. **Atualização do Reddit** — o bot autentica-se no Reddit, vai buscar o conteúdo atual da thread e decide:
+   - **Se a thread já tiver sido atualizada pelo bot** → pede ao LLM que **atualize** o conteúdo existente.
+   - **Se a thread ainda for nova** → pede ao LLM que **crie o conteúdo do zero**.
+10. **Publicação** — anexa um rodapé com o link do GitHub + link para a thread do mercado anterior + marcador do bot, e publica/edita o post.
+11. **Notificação de falhas** — se algo correr mal, o bot cria automaticamente um GitHub Issue com o erro (ou comenta num issue de falha aberto existente, para evitar duplicados).
 
 > Cada rumor inclui uma coluna **Fontes** com hiperlinks reais para os artigos (múltiplas fontes quando disponíveis), e uma coluna **Confiança** (🟢 Alta / 🟡 Média / 🔴 Baixa) baseada no tier das fontes e no número de fontes.
 
@@ -23,18 +37,39 @@ Corre automaticamente no **GitHub Actions** durante os períodos de mercado aber
 
 ```
 PortoBotNews/
-├── .github/workflows/tracker.yml   # Pipeline do GitHub Actions (agenda + manual)
+├── .github/workflows/tracker.yml      # Pipeline do GitHub Actions (agenda + manual)
+├── .cache/                            # Caches locais (URLs processados, hashes) — auto-gerado, NÃO commitar
+├── bot/                              # Pacote Python com módulos separados
+│   ├── __init__.py                    # Inicialização do pacote
+│   ├── cache.py                       # Cache de URLs (deduplicação entre runs)
+│   ├── constants.py                   # Constantes, providers, RSS feeds, fontes fallback
+│   ├── diff.py                        # Deteção de alterações (hash-based)
+│   ├── feeds.py                       # RSS feeds (suplemento ao DuckDuckGo)
+│   ├── llm.py                         # Interação com LLM (multi-provider fallback)
+│   ├── market.py                      # Janela de transferências e títulos
+│   ├── notify.py                      # Notificações de erro (GitHub Issues)
+│   ├── prompt.py                      # Construção do prompt + sistema two-pass
+│   ├── reddit.py                      # Interação com Reddit (PRAW)
+│   ├── search.py                      # Pesquisa DuckDuckGo (com retry + data + phase-aware)
+│   └── validation.py                  # Validação de conteúdo pré-publicação
+├── tests/                             # Testes unitários (81 testes)
+│   ├── test_cache.py                  # Testes de cache/deduplicação
+│   ├── test_diff.py                   # Testes de deteção de alterações
+│   ├── test_market.py                 # Testes de janela de transferências
+│   ├── test_prompt.py                 # Testes de parsing de refetch
+│   ├── test_search.py                 # Testes de queries e formatação
+│   └── test_validation.py             # Testes de validação de conteúdo
 ├── prompts/
-│   └── transfer_news.md            # Prompt do LLM (personalizável)
+│   └── transfer_news.md               # Prompt do LLM (personalizável)
 ├── sources/
-│   ├── trustworthy.md              # Sites fiáveis (Tier 1) — gera queries site:
-│   └── sketchy.md                  # Sites menos fiáveis (Tier 2) — gera queries site:
-├── main.py                         # Lógica do bot
-├── run_local.ps1                   # Script local de teste (Windows)
-├── requirements.txt                # Dependências Python
-├── .env.example                    # Modelo das variáveis de ambiente
-├── .gitignore                      # Protege .env e preview.md
-├── LICENSE                         # MIT
+│   ├── trustworthy.md                 # Sites fiáveis (Tier 1) — gera queries site:
+│   └── sketchy.md                     # Sites menos fiáveis (Tier 2) — gera queries site:
+├── main.py                            # Orquestrador principal (thin)
+├── run_local.ps1                      # Script local de teste (Windows)
+├── requirements.txt                   # Dependências Python
+├── .env.example                       # Modelo das variáveis de ambiente
+├── .gitignore                         # Protege .env, .cache/ e preview.md
+├── LICENSE                            # MIT
 └── README.md
 ```
 
@@ -97,7 +132,7 @@ O bot só corre durante os períodos de mercado aberto, para não desperdiçar r
 | **Mercado de Verão** | 1 de junho | 11 de setembro | 1 mês antes da abertura (1 jul) + 1 semana após o fecho (~4 set) |
 | **Mercado de Inverno** | 4 de dezembro | 8 de fevereiro | 1 mês antes da abertura (~4 jan) + 1 semana após o fecho (~1 fev) |
 
-- Durante a janela ativa: corre **2x por dia** (12:00 e 20:00 UTC).
+- Durante a janela ativa: corre **1x por dia** (12:00 UTC).
 - Fora da janela: as runs agendadas abortam automaticamente no primeiro step (sem chamadas à API, sem custos).
 - **Runs manuais** (`workflow_dispatch`) ignoram a verificação de data — podes correr quando quiseres.
 - Para forçar uma run agendada fora da janela, usa o input **"Forçar execução"** no workflow manual.
@@ -122,8 +157,9 @@ O bot é **totalmente autónomo** — não precisas de criar o post manualmente 
 
 ### Windows (script automático)
 ```powershell
-.\run_local.ps1              # instala deps (se faltar) + corre preview
-.\run_local.ps1 -NoInstall   # só corre o preview (deps já instaladas)
+.\run_local.ps1              # instala deps + corre testes + preview
+.\run_local.ps1 -NoInstall   # só corre testes + preview (deps já instaladas)
+.\run_local.ps1 -Force       # força regeneração mesmo sem conteúdo novo
 .\run_local.ps1 -Live        # publica a sério no Reddit (não usa dry-run)
 ```
 
@@ -142,7 +178,9 @@ python -m venv .venv
 # source .venv/bin/activate     # macOS/Linux
 pip install -r requirements.txt
 cp .env.example .env            # preenche as variáveis
+python -m pytest tests/ -v      # corre os testes unitários
 python main.py --dry-run        # preview (não publica)
+python main.py --dry-run --force  # preview forçado (ignora change detection)
 python main.py                  # publicar a sério
 ```
 
@@ -151,17 +189,59 @@ Vai a **Actions → "Bot Mercado FCPorto" → Run workflow** → tick **"Modo pr
 - Não publica no Reddit.
 - Gera `preview.md` como artifact descarregável (7 dias).
 
+## Testes
+
+O projeto tem **81 testes unitários** que cobrem os componentes críticos:
+
+| Módulo | Ficheiro | O que testa |
+|--------|----------|-------------|
+| `market.py` | `tests/test_market.py` | Deteção de janela (verão/inverno), geração de títulos |
+| `search.py` | `tests/test_search.py` | Queries phase-aware, formatação, filtragem por data, parsing de URLs, stats exclusion |
+| `feeds.py` | `tests/test_feeds.py` | RSS feed fetching, filtering FC Porto articles, merging DDG+RSS |
+| `prompt.py` | `tests/test_prompt.py` | Parsing de REFETCH requests, stripping de secções |
+| `validation.py` | `tests/test_validation.py` | Validação de URLs, tabelas, sources banidas, nomes de jogadores |
+| `diff.py` | `tests/test_diff.py` | Hashing de conteúdo, deteção de alterações |
+| `cache.py` | `tests/test_cache.py` | Cache de URLs, deduplicação, migração de formato, expiração |
+
+```bash
+# Correr todos os testes
+python -m pytest tests/ -v
+
+# Correr um módulo específico
+python -m pytest tests/test_validation.py -v
+```
+
+Os testes correm automaticamente no GitHub Actions antes da execução do bot.
+
 ## Personalizar
 
 - **Prompt:** edita [`prompts/transfer_news.md`](prompts/transfer_news.md) (mantém os tokens `{{...}}`).
 - **Fontes / ranking:** edita [`sources/trustworthy.md`](sources/trustworthy.md) e [`sources/sketchy.md`](sources/sketchy.md). Os domínios listados geram automaticamente queries `site:` no DuckDuckGo — adicionar ou remover um site aqui muda a pesquisa sem tocar no código.
 - **Agenda:** edita o `cron` em [`.github/workflows/tracker.yml`](.github/workflows/tracker.yml).
 - **Datas das janelas:** edita as variáveis no step "Verificar janela de transferências" no workflow.
-- **Queries de pesquisa:** edita a função `build_search_queries()` em [`main.py`](main.py).
+- **Queries de pesquisa:** edita a função `build_search_queries()` em [`bot/search.py`](bot/search.py). As queries são phase-aware (confirmadas, rumor, negociação) e os termos `site:` são diversificados entre domínios.
+- **RSS feeds:** edita a lista `RSS_FEEDS` em [`bot/constants.py`](bot/constants.py).
 
 ## Transparência
 
-Cada post gerado inclui no rodapé um link para este repositório, indicando que o conteúdo foi gerado automaticamente por IA. Isto é uma boa prática para bots no Reddit e mantém a comunidade informada.
+Cada post gerado inclui no rodapé um link para este repositório, um link para a thread do mercado anterior (quando aplicável), e a indicação de que o conteúdo foi gerado automaticamente por IA. Isto é uma boa prática para bots no Reddit e mantém a comunidade informada.
+
+## Arquitetura do código (v2.0)
+
+O código foi reestruturado num pacote `bot/` com módulos separados por responsabilidade:
+
+- **`main.py`** — orquestrador thin (apenas coordena o fluxo, sem lógica de negócio)
+- **`bot/constants.py`** — constantes, providers de LLM, RSS feeds, fontes fallback
+- **`bot/market.py`** — deteção de janela de transferências
+- **`bot/search.py`** — pesquisa DuckDuckGo com retry, date filtering, queries phase-aware, stats domain exclusion
+- **`bot/feeds.py`** — RSS feeds de fontes portuguesas (suplemento ao DDG)
+- **`bot/cache.py`** — cache persistente de URLs processados
+- **`bot/prompt.py`** — construção do prompt e sistema two-pass
+- **`bot/llm.py`** — interação com LLM com fallback multi-provider
+- **`bot/validation.py`** — validação de conteúdo pré-publicação
+- **`bot/diff.py`** — deteção de alterações entre runs
+- **`bot/reddit.py`** — interação com Reddit via PRAW
+- **`bot/notify.py`** — notificações de erro via GitHub Issues
 
 ---
 

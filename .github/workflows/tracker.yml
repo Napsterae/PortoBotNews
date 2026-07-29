@@ -2,9 +2,9 @@ name: Bot Mercado FCPorto
 
 on:
   schedule:
-    # Corre todos os dias às 12:00 e às 20:00 (UTC)
+    # Corre todos os dias às 12:00 (UTC)
     # O step "Verificar janela de transferências" abaixo decide se o bot corre ou não.
-    - cron: '0 12,20 * * *'
+    - cron: '0 12 * * *'
   workflow_dispatch: # Botão manual no GitHub para correr quando quiseres
     inputs:
       dry_run:
@@ -19,9 +19,11 @@ on:
         default: false
 
 # Permite ao `gh` ler o histórico de runs (para o failsafe)
+# `issues: write` permite criar Issues automaticamente em caso de falha
 permissions:
   actions: read
   contents: read
+  issues: write
 
 # Garante que duas runs nunca se sobrepõem (evita editar o post em paralelo)
 concurrency:
@@ -31,7 +33,7 @@ concurrency:
 jobs:
   update-reddit:
     runs-on: ubuntu-latest
-    timeout-minutes: 15 # mata a run se ficar presa (ex.: LLM pendurado)
+    timeout-minutes: 45 # two-pass: 2 LLM calls (up to 10min each on large prompts) + 2 searches + validação
 
     steps:
       # ─── Verificar se estamos na janela de transferências ativa ────────────
@@ -132,6 +134,26 @@ jobs:
           (github.event_name == 'schedule' && steps.market_check.outputs.should_run == 'true')
         run: pip install -r requirements.txt
 
+      # ─── Cache persistente para deduplicação de URLs e deteção de alterações ──
+      # Sem este passo, runners efémeros não guardam .cache/ entre runs e as
+      # features de dedup/change-detection são no-ops em CI.
+      - name: Restaurar cache do bot
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'schedule' && steps.market_check.outputs.should_run == 'true')
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: portobotnews-cache-${{ github.ref_name }}
+          restore-keys: |
+            portobotnews-cache-
+
+      - name: Correr Testes
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'schedule' && steps.market_check.outputs.should_run == 'true')
+        run: pip install pytest && python -m pytest tests/ -v
+
       - name: Atualizar / Criar Post no Reddit
         if: |
           github.event_name == 'workflow_dispatch' ||
@@ -146,7 +168,9 @@ jobs:
           REDDIT_PASSWORD: ${{ secrets.REDDIT_PASSWORD }}
           REDDIT_POST_ID: ${{ secrets.REDDIT_POST_ID }}
           GITHUB_REPO_URL: "https://github.com/${{ github.repository }}"
-          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '' }}
         run: python main.py
 
       - name: Upload do preview (apenas em dry-run)

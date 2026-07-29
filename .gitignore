@@ -34,3 +34,6 @@ Thumbs.db
 
 # Output do modo preview (dry-run) — nunca commitar
 preview.md
+
+# Caches do bot (URLs processados, hashes de conteúdo)
+.cache/

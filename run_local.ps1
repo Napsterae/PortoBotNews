@@ -11,7 +11,8 @@
 
 param(
   [switch]$NoInstall,
-  [switch]$Live
+  [switch]$Live,
+  [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
@@ -97,13 +98,22 @@ if ($foundProviders.Count -eq 0) {
 
 Write-Ok "Providers configurados: $($foundProviders -join ', ')"
 
-# --- 5. Correr o bot ---
+# --- 5. Correr testes (se não for live) ---
+if (-not $Live) {
+  Write-Step "Correr testes unitários"
+  & $venvPython -m pytest tests/ -v
+  if (-not $?) { Write-Warn "Alguns testes falharam — a continuar mesmo assim." }
+}
+
+# --- 6. Correr o bot ---
 if ($Live) {
   Write-Step "Correr o bot (LIVE - vai publicar no Reddit)"
   $cmdArgs = @("main.py")
+  if ($Force) { $cmdArgs += "--force" }
 } else {
   Write-Step "Correr o bot (PREVIEW / dry-run - nao publica)"
   $cmdArgs = @("main.py", "--dry-run")
+  if ($Force) { $cmdArgs += "--force" }
 }
 
 & $venvPython @cmdArgs
